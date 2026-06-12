@@ -31,6 +31,7 @@ from utils.train_utils import (
 )
 from generation import run_generation
 from configs.config import load_config_from_yaml, apply_config_overrides, load_sampling_configs, SamplingConfig
+from modules.geometry_router import geometry_model_kwargs
 from modules.model import ELF_models
 from utils.data_utils import get_dataloader, prepare_batch, load_dataset, get_pad_token_id
 from train_step import train_step
@@ -152,6 +153,22 @@ def run_training(config, *, force_cpu: bool = False):
     except TypeError:
         vocab_size = tokenizer.vocab_size
     log_for_0(f"Tokenizer vocab: CE head={vocab_size}")
+    geometry_router_enabled = bool(getattr(config, "geometry_router_enabled", False))
+    if geometry_router_enabled and getattr(config, "geometry_router_mode", "soft") != "soft":
+        raise NotImplementedError(
+            f"geometry_router_mode='{config.geometry_router_mode}' is reserved; only 'soft' is implemented")
+    if geometry_router_enabled:
+        log_for_0(
+            "Geometry router: enabled | "
+            f"layers={getattr(config, 'geometry_router_layers', 'all')}, "
+            f"hyperbolic_score={getattr(config, 'geometry_hyperbolic_score', 'busemann_proxy')}, "
+            f"sphere_score={getattr(config, 'geometry_sphere_score', 'cosine')}, "
+            f"sphere_k={getattr(config, 'geometry_router_sphere_k', '0.25,0.5,1.0,2.0,4.0')}, "
+            f"sample_size={getattr(config, 'geometry_router_sample_size', 32)}, "
+            f"quad_samples={getattr(config, 'geometry_router_quad_samples', 512)}"
+        )
+    else:
+        log_for_0("Geometry router: disabled")
     model = ELF_models[config.model](
         text_encoder_dim=encoder_config.d_model, max_length=config.max_length,
         attn_drop=config.attn_dropout, proj_drop=config.proj_dropout,
@@ -161,6 +178,7 @@ def run_training(config, *, force_cpu: bool = False):
         num_model_mode_tokens=config.num_model_mode_tokens,
         bottleneck_dim=config.bottleneck_dim,
         gradient_checkpointing=bool(getattr(config, "gradient_checkpointing", True)),
+        **geometry_model_kwargs(config),
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())

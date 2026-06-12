@@ -8,18 +8,24 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from modules.layers import (
-    Attention, BottleneckTextProj, FinalLayer, RMSNorm, SwiGLUFFN,
-    TextRotaryEmbeddingFast, TimestepEmbedder,
+    Attention, BottleneckTextProj, FinalLayer, GeometryRoutedAttention,
+    RMSNorm, SwiGLUFFN, TextRotaryEmbeddingFast, TimestepEmbedder,
     DEFAULT_KERNEL_INIT, DEFAULT_BIAS_INIT, NORMAL_INIT_002,
     _make_linear,
 )
+from modules.geometry_router import GeometryRouter, parse_layer_spec
 
 
 class ELFBlock(nn.Module):
     """ELF Transformer block."""
 
     def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0,
-                 attn_drop: float = 0.0, proj_drop: float = 0.0):
+                 attn_drop: float = 0.0, proj_drop: float = 0.0,
+                 geometry_router_enabled: bool = False,
+                 geometry_router: Optional[nn.Module] = None,
+                 hyperbolic_curvature: float = 1.0,
+                 hyperbolic_score: str = "busemann_proxy",
+                 sphere_score: str = "cosine"):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -28,19 +34,36 @@ class ELFBlock(nn.Module):
         self.proj_drop = proj_drop
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
-        self.attn = Attention(
-            hidden_size, num_heads, qkv_bias=True, qk_norm=True,
-            attn_drop=attn_drop, proj_drop=proj_drop,
-        )
+        if geometry_router_enabled and geometry_router is not None:
+            self.attn = GeometryRoutedAttention(
+                hidden_size, num_heads, qkv_bias=True, qk_norm=True,
+                attn_drop=attn_drop, proj_drop=proj_drop,
+                geometry_router=geometry_router,
+                hyperbolic_curvature=hyperbolic_curvature,
+                hyperbolic_score=hyperbolic_score,
+                sphere_score=sphere_score,
+            )
+        else:
+            self.attn = Attention(
+                hidden_size, num_heads, qkv_bias=True, qk_norm=True,
+                attn_drop=attn_drop, proj_drop=proj_drop,
+            )
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop)
 
     def forward(self, x: torch.Tensor, rope_fn: Optional[nn.Module] = None,
                 attention_mask: Optional[torch.Tensor] = None,
-                deterministic: bool = True) -> torch.Tensor:
+                deterministic: bool = True,
+                t: Optional[torch.Tensor] = None,
+                geometry_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x_normed = self.norm1(x)
-        attn_out = self.attn(x_normed, rope_fn, attention_mask=attention_mask,
-                             deterministic=deterministic)
+        if isinstance(self.attn, GeometryRoutedAttention):
+            attn_out = self.attn(x_normed, rope_fn, attention_mask=attention_mask,
+                                 deterministic=deterministic, t=t,
+                                 geometry_mask=geometry_mask)
+        else:
+            attn_out = self.attn(x_normed, rope_fn, attention_mask=attention_mask,
+                                 deterministic=deterministic)
         x = x + attn_out
 
         x_normed = self.norm2(x)
@@ -68,6 +91,24 @@ class ELF(nn.Module):
         num_model_mode_tokens: int = 0,
         vocab_size: int = 0,
         gradient_checkpointing: bool = False,
+        geometry_router_enabled: bool = False,
+        geometry_router_layers: str = "all",
+        geometry_router_sample_size: int = 32,
+        geometry_router_quad_samples: int = 512,
+        geometry_router_tau_h: float = 4.0,
+        geometry_router_tau_s: float = 4.0,
+        geometry_router_bias_e: float = 2.0,
+        geometry_router_bias_h: float = -2.0,
+        geometry_router_bias_s: float = -2.0,
+        geometry_router_time_e_bias: float = 1.0,
+        geometry_router_time_h_bias: float = 0.0,
+        geometry_router_time_s_bias: float = 0.0,
+        geometry_router_sphere_k: str = "0.25,0.5,1.0,2.0,4.0",
+        geometry_router_eps: float = 1e-6,
+        geometry_router_detach_scores: bool = True,
+        geometry_hyperbolic_curvature: float = 1.0,
+        geometry_hyperbolic_score: str = "busemann_proxy",
+        geometry_sphere_score: str = "cosine",
     ):
         super().__init__()
         self.text_encoder_dim = text_encoder_dim
@@ -115,14 +156,45 @@ class ELF(nn.Module):
             dim=head_dim, pt_seq_len=max_length, num_empty_token=prefix_total,
         )
 
+        # Geometry router: one (parameter-free) router per routed block, so
+        # the disabled model keeps an identical state_dict to the original.
+        self.geometry_router_enabled = geometry_router_enabled
+        routed_layers = (
+            parse_layer_spec(geometry_router_layers, depth)
+            if geometry_router_enabled else set()
+        )
+
+        def _make_router() -> GeometryRouter:
+            return GeometryRouter(
+                sample_size=geometry_router_sample_size,
+                quad_samples=geometry_router_quad_samples,
+                sphere_k_candidates=geometry_router_sphere_k,
+                tau_h=geometry_router_tau_h,
+                tau_s=geometry_router_tau_s,
+                bias_e=geometry_router_bias_e,
+                bias_h=geometry_router_bias_h,
+                bias_s=geometry_router_bias_s,
+                time_e_bias=geometry_router_time_e_bias,
+                time_h_bias=geometry_router_time_h_bias,
+                time_s_bias=geometry_router_time_s_bias,
+                eps=geometry_router_eps,
+                detach_scores=geometry_router_detach_scores,
+            )
+
         self.blocks = nn.ModuleList()
         q1, q3 = depth // 4, depth // 4 * 3
         for i in range(depth):
             in_drop_range = q3 > i >= q1
+            block_routed = i in routed_layers
             self.blocks.append(ELFBlock(
                 hidden_size, num_heads, mlp_ratio=mlp_ratio,
                 attn_drop=attn_drop if in_drop_range else 0.0,
                 proj_drop=proj_drop if in_drop_range else 0.0,
+                geometry_router_enabled=block_routed,
+                geometry_router=_make_router() if block_routed else None,
+                hyperbolic_curvature=geometry_hyperbolic_curvature,
+                hyperbolic_score=geometry_hyperbolic_score,
+                sphere_score=geometry_sphere_score,
             ))
 
         # Final flow-matching output head.
@@ -168,6 +240,17 @@ class ELF(nn.Module):
         """x: (N, S, C) or (N, S, 2C) with self-cond. t: (N,). attention_mask: (N, S), 1=valid."""
         B = x.shape[0]
 
+        # Geometry router statistics only consider the actual text/latent
+        # tokens, never the prepended control tokens, so remember the
+        # original-token validity before any prefix concatenation.
+        original_token_mask = None
+        if self.geometry_router_enabled:
+            if attention_mask is None:
+                original_token_mask = torch.ones(
+                    (B, x.shape[1]), dtype=torch.float32, device=x.device)
+            else:
+                original_token_mask = attention_mask.to(torch.float32).clone()
+
         # Self-conditioning: input is [z, x_pred] when 2x encoder dim
         with torch.amp.autocast('cuda', enabled=False):
             if x.shape[-1] == 2 * self.text_encoder_dim:
@@ -205,17 +288,28 @@ class ELF(nn.Module):
                                          dtype=attention_mask.dtype, device=attention_mask.device)
                 attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)
 
+        # Sequence layout after prepends is [prefix_tokens, mode_tokens,
+        # actual_tokens]; control tokens stay valid for attention but are
+        # excluded from the router's geometry statistics.
+        geometry_mask = None
+        if self.geometry_router_enabled:
+            geometry_mask = torch.cat([
+                torch.zeros((B, prefix_len + model_mode_offset),
+                            dtype=torch.float32, device=x.device),
+                original_token_mask,
+            ], dim=1)
+
         use_checkpoint = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
         for block in self.blocks:
             if use_checkpoint:
                 def _block_forward(hidden: torch.Tensor, block: ELFBlock = block) -> torch.Tensor:
                     return block(hidden, rope_fn=self.feat_rope, attention_mask=attention_mask,
-                                 deterministic=deterministic)
+                                 deterministic=deterministic, t=t, geometry_mask=geometry_mask)
 
                 x = checkpoint(_block_forward, x, use_reentrant=False)
             else:
                 x = block(x, rope_fn=self.feat_rope, attention_mask=attention_mask,
-                          deterministic=deterministic)
+                          deterministic=deterministic, t=t, geometry_mask=geometry_mask)
 
         x = x[:, prefix_len + model_mode_offset:]
 

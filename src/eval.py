@@ -15,6 +15,7 @@ import torch.distributed as dist
 from transformers import AutoTokenizer
 
 from modules.t5_encoder import get_encoder
+from modules.geometry_router import geometry_model_kwargs
 from modules.model import ELF_models
 from utils.logging_utils import log_for_0
 from utils.checkpoint_utils import load_checkpoint
@@ -133,6 +134,7 @@ def main():
         vocab_size=vocab_size,
         num_model_mode_tokens=config.num_model_mode_tokens,
         bottleneck_dim=config.bottleneck_dim,
+        **geometry_model_kwargs(config),
     ).to(device)
 
     # Train state template (only used to plumb EMA params + step/epoch).
