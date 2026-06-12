@@ -16,9 +16,11 @@ SRC = os.path.join(REPO_ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
+from configs.config import Config  # noqa: E402
 from modules.geometry_router import (  # noqa: E402
     GeometryRouter, estimate_delta_rel, estimate_spherical_fit,
-    masked_token_subsample, pairwise_dist, parse_float_list, parse_layer_spec,
+    geometry_model_kwargs, masked_token_subsample, pairwise_dist,
+    parse_float_list, parse_layer_spec, validate_geometry_router_config,
 )
 from modules.layers import Attention, GeometryRoutedAttention  # noqa: E402
 from modules.model import ELF_models  # noqa: E402
@@ -216,6 +218,118 @@ class TestEnabledModelForward(unittest.TestCase):
         self.assertEqual(dec.shape, (2, 16, 128))
         self.assertTrue(torch.isfinite(out).all())
         self.assertTrue(torch.isfinite(dec).all())
+
+
+class TestConfigValidation(unittest.TestCase):
+    """Reserved options must be rejected loudly, not silently ignored."""
+
+    def _enabled_config(self) -> Config:
+        c = Config()
+        c.geometry_router_enabled = True
+        return c
+
+    def test_disabled_config_never_validated(self):
+        c = Config()
+        c.geometry_router_on_attention = False  # nonsense, but router is off
+        c.geometry_router_on_mlp = True
+        validate_geometry_router_config(c)  # must not raise
+
+    def test_on_attention_false_rejected(self):
+        c = self._enabled_config()
+        c.geometry_router_on_attention = False
+        with self.assertRaises(NotImplementedError):
+            geometry_model_kwargs(c)
+
+    def test_on_mlp_true_rejected(self):
+        c = self._enabled_config()
+        c.geometry_router_on_mlp = True
+        with self.assertRaises(NotImplementedError):
+            geometry_model_kwargs(c)
+
+    def test_hard_mode_rejected(self):
+        c = self._enabled_config()
+        c.geometry_router_mode = "hard"
+        with self.assertRaises(NotImplementedError):
+            geometry_model_kwargs(c)
+
+    def test_valid_enabled_config_passes(self):
+        kw = geometry_model_kwargs(self._enabled_config())
+        self.assertTrue(kw["geometry_router_enabled"])
+        self.assertFalse(kw["geometry_router_denoiser_only"])
+
+
+class TestDenoiserOnly(unittest.TestCase):
+    """geometry_router_denoiser_only: decoder rows / decode path stay Euclidean."""
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(0)
+        common = dict(
+            text_encoder_dim=512, max_length=16, vocab_size=128,
+            num_time_tokens=4, num_self_cond_cfg_tokens=4, num_model_mode_tokens=4,
+        )
+        cls.disabled = ELF_models["ELF-B"](**common, geometry_router_enabled=False)
+        # final_layer.linear is zero-initialized, which would make every
+        # `output` identically zero and the difference assertions vacuous —
+        # give it (shared) random weights so outputs are informative.
+        torch.nn.init.normal_(cls.disabled.final_layer.linear.weight, std=0.02)
+        torch.nn.init.normal_(cls.disabled.final_layer.linear.bias, std=0.02)
+        # Hostile router prior (strongly hyperbolic) so routed rows visibly
+        # differ from Euclidean rows.
+        router_kw = dict(
+            geometry_router_enabled=True, geometry_router_layers="all",
+            geometry_router_sample_size=8, geometry_router_quad_samples=64,
+            geometry_router_bias_e=-4.0, geometry_router_bias_h=4.0,
+            geometry_router_time_e_bias=0.0,
+        )
+        cls.routed = ELF_models["ELF-B"](
+            **common, **router_kw, geometry_router_denoiser_only=True)
+        cls.routed.load_state_dict(cls.disabled.state_dict())
+        cls.routed_always = ELF_models["ELF-B"](
+            **common, **router_kw, geometry_router_denoiser_only=False)
+        cls.routed_always.load_state_dict(cls.disabled.state_dict())
+        for m in (cls.disabled, cls.routed, cls.routed_always):
+            m.eval()
+        torch.manual_seed(7)
+        cls.x = torch.randn(2, 16, 512)
+        cls.t = torch.tensor([0.3, 0.6])
+        cls.sc = torch.ones(2)
+
+    def test_decode_path_bypasses_routing(self):
+        # decoder_step_active=True (python bool) = decode-mode forward:
+        # denoiser-only model must match the disabled model exactly.
+        with torch.no_grad():
+            out_d, dec_d = self.disabled(self.x, self.t, self_cond_cfg_scale=self.sc,
+                                         decoder_step_active=True)
+            out_r, dec_r = self.routed(self.x, self.t, self_cond_cfg_scale=self.sc,
+                                       decoder_step_active=True)
+            out_a, _ = self.routed_always(self.x, self.t, self_cond_cfg_scale=self.sc,
+                                          decoder_step_active=True)
+        self.assertTrue(torch.equal(out_d, out_r))
+        self.assertTrue(torch.equal(dec_d, dec_r))
+        # ... while the default (shared-backbone) mode keeps routing here.
+        self.assertFalse(torch.allclose(out_d, out_a, atol=1e-3))
+
+    def test_denoiser_forward_stays_routed(self):
+        # No decoder_step_active = pure denoiser call: routing must be live.
+        with torch.no_grad():
+            out_d, _ = self.disabled(self.x, self.t, self_cond_cfg_scale=self.sc)
+            out_r, _ = self.routed(self.x, self.t, self_cond_cfg_scale=self.sc)
+        self.assertFalse(torch.allclose(out_d, out_r, atol=1e-3))
+
+    def test_mixed_rows(self):
+        # Row 0 decoder-mode (forced Euclidean), row 1 denoiser-mode (routed).
+        active = torch.tensor([1.0, 0.0])
+        with torch.no_grad():
+            out_d, _ = self.disabled(self.x, self.t, self_cond_cfg_scale=self.sc,
+                                     decoder_step_active=active)
+            out_r, _ = self.routed(self.x, self.t, self_cond_cfg_scale=self.sc,
+                                   decoder_step_active=active)
+        # Decoder row: Euclidean gate -> matches disabled model (custom
+        # softmax vs SDPA gives tiny numerical差, hence atol not equal).
+        self.assertTrue(torch.allclose(out_d[0], out_r[0], atol=1e-4))
+        # Denoiser row: visibly routed away from Euclidean.
+        self.assertFalse(torch.allclose(out_d[1], out_r[1], atol=1e-3))
 
 
 if __name__ == "__main__":

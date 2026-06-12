@@ -372,8 +372,16 @@ class GeometryRoutedAttention(nn.Module):
                 attention_mask: Optional[torch.Tensor] = None,
                 deterministic: bool = True,
                 t: Optional[torch.Tensor] = None,
-                geometry_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """x: (B, N, C). attention_mask: optional (B, N), 1=valid. t: (B,)."""
+                geometry_mask: Optional[torch.Tensor] = None,
+                routing_active: bool = True,
+                router_row_active: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """x: (B, N, C). attention_mask: optional (B, N), 1=valid. t: (B,).
+
+        routing_active=False bypasses routing for the whole call (original
+        SDPA path). router_row_active: optional (B,) with 1=routed row,
+        0=row forced to the pure Euclidean gate (used by denoiser-only mode
+        for decoder-mode rows in the mixed training forward).
+        """
         B, N, C = x.shape
         head_dim = self.dim // self.num_heads
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, head_dim).permute(2, 0, 3, 1, 4)
@@ -385,7 +393,7 @@ class GeometryRoutedAttention(nn.Module):
             q = rope_fn(q)
             k = rope_fn(k)
 
-        if self.geometry_router is None:
+        if self.geometry_router is None or not routing_active:
             # Fallback: behave like the original Attention.
             out = scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
         else:
@@ -410,6 +418,12 @@ class GeometryRoutedAttention(nn.Module):
                 logits_s, v, attention_mask, self.attn_drop, deterministic)
 
             gates, _ = self.geometry_router(x, t, geometry_mask)  # (B, 3)
+            if router_row_active is not None:
+                # Rows flagged inactive get the pure Euclidean gate [1, 0, 0].
+                euclid = torch.zeros_like(gates)
+                euclid[:, 0] = 1.0
+                act = router_row_active.to(gates.dtype).view(-1, 1)
+                gates = act * gates + (1.0 - act) * euclid
             g = gates.to(out_e.dtype).view(B, 3, 1, 1, 1)
             out = g[:, 0] * out_e + g[:, 1] * out_h + g[:, 2] * out_s
 

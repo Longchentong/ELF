@@ -55,12 +55,16 @@ class ELFBlock(nn.Module):
                 attention_mask: Optional[torch.Tensor] = None,
                 deterministic: bool = True,
                 t: Optional[torch.Tensor] = None,
-                geometry_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                geometry_mask: Optional[torch.Tensor] = None,
+                routing_active: bool = True,
+                router_row_active: Optional[torch.Tensor] = None) -> torch.Tensor:
         x_normed = self.norm1(x)
         if isinstance(self.attn, GeometryRoutedAttention):
             attn_out = self.attn(x_normed, rope_fn, attention_mask=attention_mask,
                                  deterministic=deterministic, t=t,
-                                 geometry_mask=geometry_mask)
+                                 geometry_mask=geometry_mask,
+                                 routing_active=routing_active,
+                                 router_row_active=router_row_active)
         else:
             attn_out = self.attn(x_normed, rope_fn, attention_mask=attention_mask,
                                  deterministic=deterministic)
@@ -93,6 +97,7 @@ class ELF(nn.Module):
         gradient_checkpointing: bool = False,
         geometry_router_enabled: bool = False,
         geometry_router_layers: str = "all",
+        geometry_router_denoiser_only: bool = False,
         geometry_router_sample_size: int = 32,
         geometry_router_quad_samples: int = 512,
         geometry_router_tau_h: float = 4.0,
@@ -159,6 +164,7 @@ class ELF(nn.Module):
         # Geometry router: one (parameter-free) router per routed block, so
         # the disabled model keeps an identical state_dict to the original.
         self.geometry_router_enabled = geometry_router_enabled
+        self.geometry_router_denoiser_only = geometry_router_denoiser_only
         routed_layers = (
             parse_layer_spec(geometry_router_layers, depth)
             if geometry_router_enabled else set()
@@ -299,17 +305,34 @@ class ELF(nn.Module):
                 original_token_mask,
             ], dim=1)
 
+        # Denoiser-only routing: decoder-mode rows fall back to the pure
+        # Euclidean gate; an all-decoder forward (decode path at generation,
+        # decoder_step_active=True) bypasses routing entirely. A forward
+        # without decoder_step_active is a denoiser call and stays routed.
+        routing_active = True
+        router_row_active = None
+        if (self.geometry_router_enabled and self.geometry_router_denoiser_only
+                and decoder_step_active is not None):
+            if isinstance(decoder_step_active, torch.Tensor) and decoder_step_active.dim() > 0:
+                router_row_active = 1.0 - decoder_step_active.to(torch.float32).reshape(-1)
+            elif bool(decoder_step_active):
+                routing_active = False
+
         use_checkpoint = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
         for block in self.blocks:
             if use_checkpoint:
                 def _block_forward(hidden: torch.Tensor, block: ELFBlock = block) -> torch.Tensor:
                     return block(hidden, rope_fn=self.feat_rope, attention_mask=attention_mask,
-                                 deterministic=deterministic, t=t, geometry_mask=geometry_mask)
+                                 deterministic=deterministic, t=t, geometry_mask=geometry_mask,
+                                 routing_active=routing_active,
+                                 router_row_active=router_row_active)
 
                 x = checkpoint(_block_forward, x, use_reentrant=False)
             else:
                 x = block(x, rope_fn=self.feat_rope, attention_mask=attention_mask,
-                          deterministic=deterministic, t=t, geometry_mask=geometry_mask)
+                          deterministic=deterministic, t=t, geometry_mask=geometry_mask,
+                          routing_active=routing_active,
+                          router_row_active=router_row_active)
 
         x = x[:, prefix_len + model_mode_offset:]
 

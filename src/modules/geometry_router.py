@@ -30,15 +30,44 @@ except Exception:  # pragma: no cover - torch always ships _dynamo, but stay saf
     dynamo = None
 
 
+def validate_geometry_router_config(config) -> None:
+    """Reject geometry-router settings the first version does not implement.
+
+    No-op when the router is disabled, so baseline configs never trip this.
+    """
+    if not getattr(config, "geometry_router_enabled", False):
+        return
+    mode = getattr(config, "geometry_router_mode", "soft")
+    if mode != "soft":
+        raise NotImplementedError(
+            f"geometry_router_mode='{mode}' is reserved; only 'soft' is implemented")
+    if not getattr(config, "geometry_router_on_attention", True):
+        raise NotImplementedError(
+            "geometry_router_on_attention=false is not implemented: v1 routes "
+            "the attention operator only, so it must stay true")
+    if getattr(config, "geometry_router_on_mlp", False):
+        raise NotImplementedError(
+            "geometry_router_on_mlp=true is reserved; v1 does not route the MLP")
+    score = getattr(config, "geometry_hyperbolic_score", "busemann_proxy")
+    if score not in ("busemann_proxy", "poincare_distance"):
+        raise ValueError(f"Unknown geometry_hyperbolic_score: {score}")
+    score = getattr(config, "geometry_sphere_score", "cosine")
+    if score not in ("cosine", "negative_angular"):
+        raise ValueError(f"Unknown geometry_sphere_score: {score}")
+
+
 def geometry_model_kwargs(config) -> Dict[str, object]:
     """Geometry-router kwargs for ELF_models[...](...), read off a Config.
 
     Uses getattr with the disabled defaults so older configs without the
-    geometry fields keep working unchanged.
+    geometry fields keep working unchanged. Validates that no reserved
+    (unimplemented) option is switched on.
     """
+    validate_geometry_router_config(config)
     return {
         "geometry_router_enabled": bool(getattr(config, "geometry_router_enabled", False)),
         "geometry_router_layers": getattr(config, "geometry_router_layers", "all"),
+        "geometry_router_denoiser_only": bool(getattr(config, "geometry_router_denoiser_only", False)),
         "geometry_router_sample_size": getattr(config, "geometry_router_sample_size", 32),
         "geometry_router_quad_samples": getattr(config, "geometry_router_quad_samples", 512),
         "geometry_router_tau_h": getattr(config, "geometry_router_tau_h", 4.0),

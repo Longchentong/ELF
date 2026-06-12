@@ -21,6 +21,10 @@ geometry_router_layers: "all"
 geometry_router_mode: "soft"
 geometry_router_on_attention: true
 geometry_router_on_mlp: false
+# false: route every forward through the shared backbone (incl. decoder/CE
+# rows and the decode path). true: strict denoiser semantics — decoder rows
+# forced to the Euclidean gate, decode-mode forwards bypass routing.
+geometry_router_denoiser_only: false
 geometry_router_detach_scores: true
 geometry_router_sample_size: 32
 geometry_router_quad_samples: 512

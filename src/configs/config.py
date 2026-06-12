@@ -100,8 +100,14 @@ class Config:
     geometry_router_enabled: bool = False
     geometry_router_layers: str = "all"  # "all", "0,1,2", or "0-3,6,8-11"
     geometry_router_mode: str = "soft"  # "soft" only; "hard" reserved (NotImplementedError)
-    geometry_router_on_attention: bool = True
-    geometry_router_on_mlp: bool = False  # reserved; v1 routes attention only
+    geometry_router_on_attention: bool = True  # v1 requires True (validated)
+    geometry_router_on_mlp: bool = False  # reserved; v1 requires False (validated)
+    # False (default): routing applies to every forward through the shared
+    # Transformer backbone, including decoder/CE-mode rows and the decode
+    # path. True: strict denoiser semantics — decoder-mode rows are forced to
+    # the pure Euclidean gate and decode-mode forwards bypass routing
+    # entirely; only denoiser (L2) forwards are routed.
+    geometry_router_denoiser_only: bool = False
     geometry_router_detach_scores: bool = True  # geometry stats under no_grad
     geometry_router_sample_size: int = 32  # tokens subsampled per example for stats
     geometry_router_quad_samples: int = 512  # deterministic quadruples for delta_rel

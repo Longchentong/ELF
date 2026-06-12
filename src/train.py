@@ -31,7 +31,7 @@ from utils.train_utils import (
 )
 from generation import run_generation
 from configs.config import load_config_from_yaml, apply_config_overrides, load_sampling_configs, SamplingConfig
-from modules.geometry_router import geometry_model_kwargs
+from modules.geometry_router import geometry_model_kwargs, validate_geometry_router_config
 from modules.model import ELF_models
 from utils.data_utils import get_dataloader, prepare_batch, load_dataset, get_pad_token_id
 from train_step import train_step
@@ -154,13 +154,12 @@ def run_training(config, *, force_cpu: bool = False):
         vocab_size = tokenizer.vocab_size
     log_for_0(f"Tokenizer vocab: CE head={vocab_size}")
     geometry_router_enabled = bool(getattr(config, "geometry_router_enabled", False))
-    if geometry_router_enabled and getattr(config, "geometry_router_mode", "soft") != "soft":
-        raise NotImplementedError(
-            f"geometry_router_mode='{config.geometry_router_mode}' is reserved; only 'soft' is implemented")
+    validate_geometry_router_config(config)  # rejects reserved/unimplemented options
     if geometry_router_enabled:
         log_for_0(
             "Geometry router: enabled | "
             f"layers={getattr(config, 'geometry_router_layers', 'all')}, "
+            f"denoiser_only={bool(getattr(config, 'geometry_router_denoiser_only', False))}, "
             f"hyperbolic_score={getattr(config, 'geometry_hyperbolic_score', 'busemann_proxy')}, "
             f"sphere_score={getattr(config, 'geometry_sphere_score', 'cosine')}, "
             f"sphere_k={getattr(config, 'geometry_router_sphere_k', '0.25,0.5,1.0,2.0,4.0')}, "
