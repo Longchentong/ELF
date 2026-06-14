@@ -10,3 +10,7 @@ __pycache__/
 # (embedded-language-flows/ELF-B-de-en-torch, ELF-B-xsum-torch) instead.
 ckpts/ELF-B-de-en-torch/
 ckpts/ELF-B-xsum-torch/
+
+# From-scratch pilot training checkpoints (large; keep eval metrics only)
+outputs/scratch_deen_base/
+outputs/scratch_deen_geom/
