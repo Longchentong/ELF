@@ -60,6 +60,20 @@ class TestRouterShape(unittest.TestCase):
         with self.assertRaises(ValueError):
             router(torch.randn(2, 16, 32), None, None)
 
+    def test_learnable_bias_and_metrics(self):
+        torch.manual_seed(0)
+        router = GeometryRouter(learnable_bias=True, log_metrics=True)
+        self.assertIn("bias", dict(router.named_parameters()))
+        hidden = torch.randn(2, 16, 32)
+        mask = torch.ones(2, 16)
+        t = torch.tensor([0.1, 0.9])
+        gates, _ = router(hidden, t, mask)
+        self.assertEqual(gates.shape, (2, 3))
+        self.assertIsNotNone(router.latest_gate_mean)
+        self.assertIsNotNone(router.latest_e_h_mean)
+        self.assertIsNotNone(router.latest_e_s_mean)
+        self.assertIsNotNone(router.latest_logits_mean)
+
 
 class TestDeltaRel(unittest.TestCase):
     """Test 2: points on a line are 0-hyperbolic -> small delta_rel."""
@@ -182,17 +196,35 @@ class TestDisabledModelParity(unittest.TestCase):
         self.assertTrue(torch.isfinite(out).all())
 
     def test_enabled_state_dict_unchanged(self):
-        # The router is parameter-free, so even the ENABLED model must keep
-        # the exact same state_dict keys (pretrained ckpts stay loadable).
+        # With default fixed priors the router adds no learnable bias; the only
+        # extra state_dict entries are the per-routed-layer gate_warmup_alpha
+        # (a requires_grad=False Parameter, one per routed block). Everything
+        # else must match the disabled model exactly.
         torch.manual_seed(0)
         routed = ELF_models["ELF-B"](
             text_encoder_dim=512, max_length=16, vocab_size=128,
             num_time_tokens=4, num_self_cond_cfg_tokens=4, num_model_mode_tokens=4,
             geometry_router_enabled=True, geometry_router_layers="0-3",
         )
-        self.assertEqual(set(routed.state_dict()), set(self.model.state_dict()))
+        extra = set(routed.state_dict()) - set(self.model.state_dict())
+        self.assertEqual(extra, {f"blocks.{i}.attn.geometry_router.gate_warmup_alpha"
+                                 for i in range(4)})
+        # gate_warmup_alpha must not be trainable.
+        for i in range(4):
+            self.assertFalse(routed.blocks[i].attn.geometry_router.gate_warmup_alpha.requires_grad)
         self.assertIsInstance(routed.blocks[0].attn, GeometryRoutedAttention)
         self.assertIsInstance(routed.blocks[4].attn, Attention)
+
+    def test_learnable_bias_adds_router_params(self):
+        torch.manual_seed(0)
+        routed = ELF_models["ELF-B"](
+            text_encoder_dim=512, max_length=16, vocab_size=128,
+            num_time_tokens=4, num_self_cond_cfg_tokens=4, num_model_mode_tokens=4,
+            geometry_router_enabled=True, geometry_router_layers="0,1",
+            geometry_router_learnable_bias=True,
+        )
+        bias_keys = [k for k in routed.state_dict() if k.endswith("geometry_router.bias")]
+        self.assertEqual(len(bias_keys), 2)
 
 
 class TestEnabledModelForward(unittest.TestCase):
@@ -218,6 +250,26 @@ class TestEnabledModelForward(unittest.TestCase):
         self.assertEqual(dec.shape, (2, 16, 128))
         self.assertTrue(torch.isfinite(out).all())
         self.assertTrue(torch.isfinite(dec).all())
+
+    def test_metrics_collection(self):
+        torch.manual_seed(0)
+        model = ELF_models["ELF-B"](
+            text_encoder_dim=512, max_length=16, vocab_size=128,
+            num_time_tokens=4, num_self_cond_cfg_tokens=4, num_model_mode_tokens=4,
+            geometry_router_enabled=True, geometry_router_layers="0,1",
+            geometry_router_sample_size=8, geometry_router_quad_samples=64,
+            geometry_router_log_metrics=True,
+        )
+        x = torch.randn(2, 16, 512)
+        t = torch.rand(2).clamp(0.05, 0.95)
+        sc = torch.ones(2)
+        with torch.no_grad():
+            model(x, t, self_cond_cfg_scale=sc)
+        metrics = model.geometry_router_metrics()
+        self.assertEqual(set(metrics), {"layer_0", "layer_1"})
+        for layer_metrics in metrics.values():
+            for key in ("gate_e", "gate_h", "gate_s", "e_H", "e_S"):
+                self.assertIn(key, layer_metrics)
 
 
 class TestConfigValidation(unittest.TestCase):
@@ -282,12 +334,15 @@ class TestDenoiserOnly(unittest.TestCase):
             geometry_router_bias_e=-4.0, geometry_router_bias_h=4.0,
             geometry_router_time_e_bias=0.0,
         )
+        # strict=False: routed models carry extra router params (learnable
+        # bias + gate_warmup_alpha) absent from the disabled model; we only
+        # want to copy the shared backbone weights so the arms match.
         cls.routed = ELF_models["ELF-B"](
             **common, **router_kw, geometry_router_denoiser_only=True)
-        cls.routed.load_state_dict(cls.disabled.state_dict())
+        cls.routed.load_state_dict(cls.disabled.state_dict(), strict=False)
         cls.routed_always = ELF_models["ELF-B"](
             **common, **router_kw, geometry_router_denoiser_only=False)
-        cls.routed_always.load_state_dict(cls.disabled.state_dict())
+        cls.routed_always.load_state_dict(cls.disabled.state_dict(), strict=False)
         for m in (cls.disabled, cls.routed, cls.routed_always):
             m.eval()
         torch.manual_seed(7)

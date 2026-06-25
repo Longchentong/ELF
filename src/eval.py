@@ -15,7 +15,7 @@ import torch.distributed as dist
 from transformers import AutoTokenizer
 
 from modules.t5_encoder import get_encoder
-from modules.geometry_router import geometry_model_kwargs
+from modules.geometry_router import geometry_model_kwargs, set_gate_warmup_alpha
 from modules.model import ELF_models
 from utils.logging_utils import log_for_0
 from utils.checkpoint_utils import load_checkpoint
@@ -151,6 +151,9 @@ def main():
 
     log_for_0(f"Loading checkpoint from: {args.checkpoint_path}")
     state, _ = load_checkpoint(args.checkpoint_path, state)
+    # Force gate-warmup off at eval (a mid-warmup checkpoint could carry a
+    # nonzero alpha; eval must always use the learned gates).
+    set_gate_warmup_alpha(state.model, 0.0)
     state.model = state.model.to(device).eval()
 
     rank = dist.get_rank() if dist.is_initialized() else 0

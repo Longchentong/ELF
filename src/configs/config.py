@@ -117,6 +117,7 @@ class Config:
     geometry_router_bias_e: float = 2.0  # strong initial Euclidean prior
     geometry_router_bias_h: float = -2.0
     geometry_router_bias_s: float = -2.0
+    geometry_router_learnable_bias: bool = False  # If true, learn per-layer E/H/S routing priors.
     geometry_router_time_e_bias: float = 1.0  # l_E += time_e_bias * (1 - t)
     geometry_router_time_h_bias: float = 0.0  # l_H += time_h_bias * t
     geometry_router_time_s_bias: float = 0.0  # l_S += time_s_bias * t
@@ -126,12 +127,18 @@ class Config:
     geometry_sphere_score: str = "cosine"  # "cosine" or "negative_angular"
     geometry_router_log_metrics: bool = False
     geometry_router_log_freq: int = 100
+    # Gate warmup: for the first N optimizer steps, blend the learned gates
+    # toward uniform [1/3,1/3,1/3] (linearly decaying 1->0) so the
+    # hyperbolic/sphere branches are forced to train early. 0 = off.
+    geometry_router_gate_warmup_steps: int = 0
+    geometry_router_metrics_path: str = None  # Optional JSON path for eval/train router summaries.
 
     # Sampling
     sampling_configs_path: str = None
     # Sampling configs sweep (list of SamplingConfig objects, loaded from YAML)
     sampling_configs: list = [SamplingConfig()]
     num_samples: int = 100
+    eval_data_offset: int = 0  # Skip this many eval examples for conditional generation.
 
     # PPL Evaluation
     online_eval: bool = True  # Enable PPL evaluation for generated samples
@@ -143,6 +150,7 @@ class Config:
     log_freq: int = 100
     eval_freq: int = 10
     save_freq: float = 100  # Can be fractional (e.g., 0.1 for saving every 0.1 epoch)
+    max_train_steps: int = None  # Optional optimizer-step cap for short finetunes.
 
     # Output
     output_dir: str = "./output_dir"

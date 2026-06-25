@@ -30,6 +30,20 @@ except Exception:  # pragma: no cover - torch always ships _dynamo, but stay saf
     dynamo = None
 
 
+def set_gate_warmup_alpha(model, alpha: float) -> None:
+    """Set the gate-warmup alpha on every GeometryRouter in `model` (in-place).
+
+    `model` should already be unwrapped of DDP/torch.compile. Updating the
+    buffer in place is picked up by the next (compiled) forward without a
+    recompile. alpha=1 forces uniform E/H/S mixing; alpha=0 uses learned gates.
+    """
+    a = float(max(0.0, min(1.0, alpha)))
+    with torch.no_grad():
+        for m in model.modules():
+            if isinstance(m, GeometryRouter):
+                m.gate_warmup_alpha.fill_(a)
+
+
 def validate_geometry_router_config(config) -> None:
     """Reject geometry-router settings the first version does not implement.
 
@@ -75,12 +89,14 @@ def geometry_model_kwargs(config) -> Dict[str, object]:
         "geometry_router_bias_e": getattr(config, "geometry_router_bias_e", 2.0),
         "geometry_router_bias_h": getattr(config, "geometry_router_bias_h", -2.0),
         "geometry_router_bias_s": getattr(config, "geometry_router_bias_s", -2.0),
+        "geometry_router_learnable_bias": bool(getattr(config, "geometry_router_learnable_bias", False)),
         "geometry_router_time_e_bias": getattr(config, "geometry_router_time_e_bias", 1.0),
         "geometry_router_time_h_bias": getattr(config, "geometry_router_time_h_bias", 0.0),
         "geometry_router_time_s_bias": getattr(config, "geometry_router_time_s_bias", 0.0),
         "geometry_router_sphere_k": getattr(config, "geometry_router_sphere_k", "0.25,0.5,1.0,2.0,4.0"),
         "geometry_router_eps": getattr(config, "geometry_router_eps", 1e-6),
         "geometry_router_detach_scores": getattr(config, "geometry_router_detach_scores", True),
+        "geometry_router_log_metrics": bool(getattr(config, "geometry_router_log_metrics", False)),
         "geometry_hyperbolic_curvature": getattr(config, "geometry_hyperbolic_curvature", 1.0),
         "geometry_hyperbolic_score": getattr(config, "geometry_hyperbolic_score", "busemann_proxy"),
         "geometry_sphere_score": getattr(config, "geometry_sphere_score", "cosine"),
@@ -294,13 +310,31 @@ if dynamo is not None:
     _compute_geometry_scores = dynamo.disable(_compute_geometry_scores)
 
 
+def _apply_gate_warmup(gates_learned: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    """Blend learned gates toward uniform by alpha (eager — keeps alpha live).
+
+    Must run eager: torch.compile constant-folds the alpha (a
+    requires_grad=False Parameter) into the graph, and a first trace at
+    alpha=1 dead-code-eliminates the learned term, freezing the gates at
+    uniform forever. Running this under dynamo.disable re-reads the live alpha
+    every step. Cheap (B x 3); autograd through gates_learned (the trainable
+    bias) is preserved across the graph break.
+    """
+    a = alpha.to(gates_learned.dtype)
+    return (1.0 - a) * gates_learned + a * (1.0 / 3.0)
+
+
+if dynamo is not None:
+    _apply_gate_warmup = dynamo.disable(_apply_gate_warmup)
+
+
 class GeometryRouter(nn.Module):
     """Soft router over [Euclidean, Hyperbolic, Sphere] attention operators.
 
-    Holds no learnable parameters or persistent buffers, so enabling it never
-    changes the model's state_dict. Gate logits combine fixed priors
-    (bias_*), the geometry scores (scaled by tau_*), and a time-dependent
-    term that, with defaults, biases routing toward Euclidean at small t.
+    By default it holds no learnable parameters or persistent buffers, so
+    enabling it keeps the original state_dict surface small. When
+    learnable_bias=True, the E/H/S logit priors become per-router Parameters
+    initialized from bias_* for finetuning experiments.
     """
 
     def __init__(
@@ -313,6 +347,7 @@ class GeometryRouter(nn.Module):
         bias_e: float = 2.0,
         bias_h: float = -2.0,
         bias_s: float = -2.0,
+        learnable_bias: bool = False,
         time_e_bias: float = 1.0,
         time_h_bias: float = 0.0,
         time_s_bias: float = 0.0,
@@ -329,18 +364,35 @@ class GeometryRouter(nn.Module):
             self.sphere_k_candidates = [float(k) for k in sphere_k_candidates]
         self.tau_h = tau_h
         self.tau_s = tau_s
-        self.bias_e = bias_e
-        self.bias_h = bias_h
-        self.bias_s = bias_s
+        self.learnable_bias = learnable_bias
+        if learnable_bias:
+            self.bias = nn.Parameter(torch.tensor([bias_e, bias_h, bias_s], dtype=torch.float32))
+        else:
+            self.bias_e = float(bias_e)
+            self.bias_h = float(bias_h)
+            self.bias_s = float(bias_s)
         self.time_e_bias = time_e_bias
         self.time_h_bias = time_h_bias
         self.time_s_bias = time_s_bias
         self.eps = eps
         self.detach_scores = detach_scores
         self.log_metrics = log_metrics
-        # Last detached gate means, for offline inspection only (not a buffer:
+        # Gate warmup: a training-time schedule that blends the learned gates
+        # toward uniform [1/3,1/3,1/3] so the hyperbolic/sphere branches are
+        # forced to contribute early (breaks the cold-start "death spiral"
+        # where suppressed branches never get trained). Implemented as a
+        # requires_grad=False Parameter, NOT a buffer: torch.compile constant-
+        # folds buffers (verified — in-place buffer updates don't reach the
+        # compiled forward), but keeps Parameters live across in-place updates.
+        # Muon/Adam skip it (they filter requires_grad), and eval resets it to
+        # 0. set_gate_warmup_alpha() updates it per-step; defaults to 0 (off).
+        self.gate_warmup_alpha = nn.Parameter(torch.zeros(1), requires_grad=False)
+        # Last detached metrics, for offline inspection only (not buffers:
         # never checkpointed, never synced).
         self.latest_gate_mean: Optional[torch.Tensor] = None
+        self.latest_e_h_mean: Optional[torch.Tensor] = None
+        self.latest_e_s_mean: Optional[torch.Tensor] = None
+        self.latest_logits_mean: Optional[torch.Tensor] = None
 
     def forward(
         self,
@@ -368,18 +420,44 @@ class GeometryRouter(nn.Module):
             )
 
         t_f = t.float().reshape(-1)
-        l_e = self.bias_e + self.time_e_bias * (1.0 - t_f)
-        l_h = self.bias_h - self.tau_h * e_h + self.time_h_bias * t_f
-        l_s = self.bias_s - self.tau_s * e_s + self.time_s_bias * t_f
+        if self.learnable_bias:
+            bias = self.bias.to(device=t_f.device, dtype=torch.float32)
+            bias_e, bias_h, bias_s = bias.unbind()
+        else:
+            bias_e, bias_h, bias_s = self.bias_e, self.bias_h, self.bias_s
+        l_e = bias_e + self.time_e_bias * (1.0 - t_f)
+        l_h = bias_h - self.tau_h * e_h + self.time_h_bias * t_f
+        l_s = bias_s - self.tau_s * e_s + self.time_s_bias * t_f
         logits = torch.stack([l_e, l_h, l_s], dim=-1)  # (B, 3)
-        gates = F.softmax(logits, dim=-1)
+        gates_learned = F.softmax(logits, dim=-1)
 
+        # Gate warmup: blend toward uniform by alpha (eager helper so alpha
+        # stays live under torch.compile; alpha=0 is a no-op). Stays
+        # normalized: (1-a)*sum(gates) + a*3*(1/3) = 1.
+        gates_eff = _apply_gate_warmup(gates_learned, self.gate_warmup_alpha)
+
+        # Metrics record the LEARNED gates (the quantity we care about: does the
+        # model choose to keep H/S open?), not the warmup-forced ones.
         scores: Dict[str, torch.Tensor] = {
             "e_H": e_h.detach(),
             "e_S": e_s.detach(),
             "logits": logits.detach(),
-            "gates": gates.detach(),
+            "gates": gates_learned.detach(),
+            "gates_eff": gates_eff.detach(),
         }
         if self.log_metrics:
-            self.latest_gate_mean = gates.detach().mean(dim=0)
-        return gates.to(hidden.dtype), scores
+            self.latest_gate_mean = gates_learned.detach().mean(dim=0)
+            self.latest_e_h_mean = e_h.detach().mean()
+            self.latest_e_s_mean = e_s.detach().mean()
+            self.latest_logits_mean = logits.detach().mean(dim=0)
+        return gates_eff.to(hidden.dtype), scores
+
+
+# Run the whole router forward eagerly under torch.compile. The gate math is
+# cheap (the expensive eigvalsh is already eager via _compute_geometry_scores),
+# and eager execution is what keeps the requires_grad=False gate_warmup_alpha
+# live: read inside a compiled graph it gets constant-folded (verified), so the
+# warmup would freeze at its first-traced value. The trainable bias still trains
+# normally via eager autograd across the graph break.
+if dynamo is not None:
+    GeometryRouter.forward = dynamo.disable(GeometryRouter.forward)
