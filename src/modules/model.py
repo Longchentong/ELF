@@ -105,12 +105,14 @@ class ELF(nn.Module):
         geometry_router_bias_e: float = 2.0,
         geometry_router_bias_h: float = -2.0,
         geometry_router_bias_s: float = -2.0,
+        geometry_router_learnable_bias: bool = False,
         geometry_router_time_e_bias: float = 1.0,
         geometry_router_time_h_bias: float = 0.0,
         geometry_router_time_s_bias: float = 0.0,
         geometry_router_sphere_k: str = "0.25,0.5,1.0,2.0,4.0",
         geometry_router_eps: float = 1e-6,
         geometry_router_detach_scores: bool = True,
+        geometry_router_log_metrics: bool = False,
         geometry_hyperbolic_curvature: float = 1.0,
         geometry_hyperbolic_score: str = "busemann_proxy",
         geometry_sphere_score: str = "cosine",
@@ -180,11 +182,13 @@ class ELF(nn.Module):
                 bias_e=geometry_router_bias_e,
                 bias_h=geometry_router_bias_h,
                 bias_s=geometry_router_bias_s,
+                learnable_bias=geometry_router_learnable_bias,
                 time_e_bias=geometry_router_time_e_bias,
                 time_h_bias=geometry_router_time_h_bias,
                 time_s_bias=geometry_router_time_s_bias,
                 eps=geometry_router_eps,
                 detach_scores=geometry_router_detach_scores,
+                log_metrics=geometry_router_log_metrics,
             )
 
         self.blocks = nn.ModuleList()
@@ -216,6 +220,44 @@ class ELF(nn.Module):
         DEFAULT_BIAS_INIT(self.proj_bias)
         DEFAULT_KERNEL_INIT(self.unembed_kernel)
         DEFAULT_BIAS_INIT(self.unembed_bias)
+
+    def geometry_router_metrics(self) -> dict:
+        """Return latest per-layer router metrics for offline inspection."""
+        metrics = {}
+        for idx, block in enumerate(self.blocks):
+            attn = getattr(block, "attn", None)
+            router = getattr(attn, "geometry_router", None)
+            if router is None:
+                continue
+            entry = {}
+            if router.latest_gate_mean is not None:
+                gate = router.latest_gate_mean.detach().float().cpu()
+                entry.update({
+                    "gate_e": float(gate[0]),
+                    "gate_h": float(gate[1]),
+                    "gate_s": float(gate[2]),
+                })
+            if router.latest_e_h_mean is not None:
+                entry["e_H"] = float(router.latest_e_h_mean.detach().float().cpu())
+            if router.latest_e_s_mean is not None:
+                entry["e_S"] = float(router.latest_e_s_mean.detach().float().cpu())
+            if router.latest_logits_mean is not None:
+                logits = router.latest_logits_mean.detach().float().cpu()
+                entry.update({
+                    "logit_e": float(logits[0]),
+                    "logit_h": float(logits[1]),
+                    "logit_s": float(logits[2]),
+                })
+            if getattr(router, "learnable_bias", False):
+                bias = router.bias.detach().float().cpu()
+                entry.update({
+                    "bias_e": float(bias[0]),
+                    "bias_h": float(bias[1]),
+                    "bias_s": float(bias[2]),
+                })
+            if entry:
+                metrics[f"layer_{idx}"] = entry
+        return metrics
 
     def build_context(self, t: torch.Tensor,
                       self_cond_cfg_scale: Optional[torch.Tensor] = None) -> list:
